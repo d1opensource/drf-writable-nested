@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from collections import OrderedDict, defaultdict, Mapping
 from urllib.parse import urlparse, unquote
 
@@ -8,7 +7,7 @@ from django.db.models import ProtectedError
 from django.db.models.fields.related import ForeignObjectRel
 from django.db.utils import IntegrityError
 from django.urls import Resolver404, resolve
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 from rest_framework.fields import set_value, SkipField, get_error_detail
