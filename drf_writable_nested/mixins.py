@@ -1,5 +1,6 @@
 from collections import OrderedDict, defaultdict
-from urllib.parse import urlparse
+from collections.abc import Mapping
+from urllib.parse import urlparse, unquote
 
 from django.contrib.contenttypes.fields import GenericRelation
 from django.contrib.contenttypes.models import ContentType
@@ -10,9 +11,79 @@ from django.db.utils import IntegrityError
 from django.utils.translation import gettext_lazy as _
 from django.urls import Resolver404, resolve
 from rest_framework import serializers
+from rest_framework.exceptions import ValidationError
+from rest_framework.fields import set_value, SkipField, get_error_detail
+from django.core.exceptions import ValidationError as DjangoValidationError, ObjectDoesNotExist
+from rest_framework.settings import api_settings
 
 
 class BaseNestedModelSerializer(serializers.ModelSerializer):
+
+    def get_unique_together_validators(self):
+        """Unique together validator needs to be disabled for Nested mixins to work properly."""
+        return []
+
+    def to_internal_value(self, data):
+        """
+        Dict of native values <- Dict of primitive datatypes.
+        """
+        if not isinstance(data, Mapping):
+            message = self.error_messages['invalid'].format(
+                datatype=type(data).__name__
+            )
+            raise ValidationError({
+                api_settings.NON_FIELD_ERRORS_KEY: [message]
+            }, code='invalid')
+
+        ret = OrderedDict()
+        errors = OrderedDict()
+        fields = self._writable_fields
+
+        for field in fields:
+            validate_method = getattr(self, 'validate_' + field.field_name, None)
+            primitive_value = field.get_value(data)
+
+            if isinstance(primitive_value, str) and isinstance(field, serializers.HyperlinkedRelatedField):
+                # we need this because DRF HyperlinkedRelatedField is not fully compatible with Django 2.0+
+                # when dealing with spaces in the URL (e.g. when we do lookup by name).
+                # The issue has been reported and reopened, see the description here:
+                # - https://github.com/encode/django-rest-framework/issues/4748
+                # Once it is resolved there, we won't need this line anymore
+                primitive_value = unquote(primitive_value)
+
+            try:
+                # For create only
+                if not self.partial and hasattr(self, 'initial_data') and isinstance(primitive_value, dict) \
+                        and 'url' in primitive_value:
+                    model_class = field.Meta.model
+                    pk = self._get_related_pk(primitive_value, model_class, related_field=field)
+                    if pk:
+                        obj = model_class.objects.filter(
+                            pk=pk,
+                        ).first()
+                        serializer = self._get_serializer_for_field(
+                            field,
+                            instance=obj,
+                        )
+                        primitive_value = {k: v for k, v in serializer.data.items()}
+                        self.initial_data[field.field_name] = primitive_value
+                validated_value = field.run_validation(primitive_value)
+                if validate_method is not None:
+                    validated_value = validate_method(validated_value)
+            except ValidationError as exc:
+                errors[field.field_name] = exc.detail
+            except DjangoValidationError as exc:
+                errors[field.field_name] = get_error_detail(exc)
+            except SkipField:
+                pass
+            else:
+                set_value(ret, field.source_attrs, validated_value)
+
+        if errors:
+            raise ValidationError(errors)
+
+        return ret
+
     def _extract_relations(self, validated_data):
         reverse_relations = OrderedDict()
         relations = OrderedDict()
@@ -42,11 +113,14 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
                     # Skip field if field is not required
                     continue
 
-                if validated_data.get(field.source) is None:
-                    if direct:
-                        # Don't process null value for direct relations
-                        # Native create/update processes these values
-                        continue
+                if direct and field.source not in self.initial_data:
+                    # Field wasn't in the initial payload, likely a nested serializer with a default value
+                    continue
+
+                if direct and validated_data.get(field.source) is None:
+                    # Don't process null value for direct relations
+                    # Native create/update processes these values
+                    continue
 
                 validated_data.pop(field.source)
                 # Reversed one-to-one looks like direct foreign keys but they
@@ -107,6 +181,25 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
 
         return instances
 
+    def _get_related_queryset(self, model_class, related_field):
+        """
+        Return a queryset of related instances with respect to custom list_serializer_class.
+
+        If custom list_serializer_class has a filter_queryset method defined, it will be used
+        to filter a set of related instances. Otherwise, all related instances will be
+        returned by default.
+
+        :param model_class: a class of related model
+        :param related_field: a DRF field or seriaizer pointing to the related objects
+        """
+        queryset = model_class.objects.all()
+
+        list_serializer_class = getattr(related_field.Meta, 'list_serializer_class', None)
+        if list_serializer_class and hasattr(list_serializer_class, 'filter_queryset'):
+            queryset = list_serializer_class.filter_queryset(queryset=queryset)
+
+        return queryset
+
     def _get_related_pk(self, data, model_class, related_field=None):
         """
         Returns a PK of the related instance mentioned in the payload.
@@ -157,10 +250,15 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
             except Resolver404:
                 return
 
-            id_value = match.kwargs[lookup_field_name]
+            id_value = unquote(match.kwargs[lookup_field_name])
 
         # getting the actual instance
-        instance = model_class.objects.filter(**{lookup_field_name: id_value}).first()
+        queryset = self._get_related_queryset(model_class, related_field)
+        try:
+            instance = queryset.get(**{lookup_field_name: id_value})
+        except ObjectDoesNotExist:
+            instance = None
+
         if instance:
             return str(instance.pk)
 
@@ -216,16 +314,15 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
         for field_name, (related_field, field, field_source) in \
                 reverse_relations.items():
 
-            if self.partial and field_name not in self.initial_data:
-                # in case of partial update, related fields don't have to be in the payload
+            # Skip processing for empty data or not-specified field.
+            # The field can be defined in validated_data but isn't defined
+            # in initial_data (for example, if multipart form data used)
+            related_data = self.initial_data.get(field_name, None)
+            if related_data is None:
                 continue
 
-            related_data = self.initial_data[field_name]
             # Expand to array of one item for one-to-one for uniformity
             if related_field.one_to_one:
-                if related_data is None:
-                    # Skip processing for empty data
-                    continue
                 related_data = [related_data]
 
             instances = self.prefetch_related_instances(field, related_data)
@@ -253,7 +350,9 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
                 data['pk'] = related_instance.pk
                 new_related_instances.append(related_instance)
 
-            if related_field.many_to_many:
+            # We check if the field was declared as a serializer for the through model.
+            # We only need to create new relations if it wasn't.
+            if related_field.many_to_many and field.Meta.model != related_field.remote_field.through:
                 # add() method is not used here for adding M2M instances
                 # because it doesn't support custom M2M proxy models
                 m2m_model_class = related_field.remote_field.through
@@ -305,6 +404,7 @@ class NestedCreateMixin(BaseNestedModelSerializer):
     """
     Mixin adds nested create feature
     """
+
     def create(self, validated_data):
         relations, reverse_relations = self._extract_relations(validated_data)
 
@@ -330,10 +430,6 @@ class NestedUpdateMixin(BaseNestedModelSerializer):
         'cannot_delete_protected': _(
             "Cannot delete {instances} because "
             "protected relation exists"),
-        'cannot_unlink_not_nullable_instances': _(
-            "Cannot unlink a nested instance from its parent instance "
-            "because it has a not-nullable key to the parent."
-        ),
     }
 
     def update(self, instance, validated_data):
@@ -375,7 +471,7 @@ class NestedUpdateMixin(BaseNestedModelSerializer):
             if related_field.many_to_many and \
                     not isinstance(related_field, ForeignObjectRel):
                 related_field_lookup = {
-                    related_field.rel.name: instance,
+                    related_field.remote_field.name: instance,
                 }
             elif isinstance(related_field, GenericRelation):
                 related_field_lookup = \
@@ -389,10 +485,9 @@ class NestedUpdateMixin(BaseNestedModelSerializer):
             # update_or_create_reverse_relations method explicitly
             payload_ids = [d.get('pk') for d in related_data if d is not None]
 
+            queryset = self._get_related_queryset(model_class, field)
             pks_to_unlink = list(
-                model_class.objects.filter(
-                    **related_field_lookup
-                ).exclude(
+                queryset.filter(**related_field_lookup).exclude(
                     pk__in=payload_ids
                 ).values_list('pk', flat=True)
             )
@@ -431,4 +526,8 @@ class NestedUpdateMixin(BaseNestedModelSerializer):
                     str(instance) for instance in instances]))
 
             except IntegrityError:
-                self.fail('cannot_unlink_not_nullable_instances')
+                raise Exception(f"Cannot unlink nested instances of '{field_name}' (related field '{related_field!r}', "
+                                f"{pks_to_unlink}) from its parent instance '{instance!r}' because they have "
+                                f"not-nullable keys to the parent. "
+                                f"If this is a many-to-many relationship, consider adding '{field_name}' "
+                                f"to Meta.allow_delete_on_update in the serializer.")
