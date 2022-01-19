@@ -1,13 +1,13 @@
-# -*- coding: utf-8 -*-
 from collections import OrderedDict, defaultdict
+from urllib.parse import urlparse
 
 from django.contrib.contenttypes.fields import GenericRelation
 from django.contrib.contenttypes.models import ContentType
-from django.utils.six.moves.urllib.parse import urlparse
-from django.db.models import ProtectedError, FieldDoesNotExist
+from django.core.exceptions import FieldDoesNotExist
+from django.db.models import ProtectedError
 from django.db.models.fields.related import ForeignObjectRel
 from django.db.utils import IntegrityError
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 from django.urls import Resolver404, resolve
 from rest_framework import serializers
 
