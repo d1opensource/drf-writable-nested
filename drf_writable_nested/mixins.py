@@ -1,4 +1,5 @@
-from collections import OrderedDict, defaultdict, Mapping
+from collections.abc import Mapping
+from collections import defaultdict, OrderedDict
 from urllib.parse import urlparse, unquote
 
 from django.contrib.contenttypes.fields import GenericRelation
