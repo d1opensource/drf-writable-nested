@@ -11,7 +11,7 @@ from django.urls import Resolver404, resolve
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
-from rest_framework.fields import set_value, SkipField, get_error_detail
+from rest_framework.fields import SkipField, get_error_detail
 from django.core.exceptions import FieldDoesNotExist, ValidationError as DjangoValidationError, ObjectDoesNotExist
 from rest_framework.settings import api_settings
 
@@ -76,7 +76,7 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
             except SkipField:
                 pass
             else:
-                set_value(ret, field.source_attrs, validated_value)
+                self.set_value(ret, field.source_attrs, validated_value)
 
         if errors:
             raise ValidationError(errors)
